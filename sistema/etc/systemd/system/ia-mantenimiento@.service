@@ -1,0 +1,13 @@
+[Unit]
+Description=Mantenimiento automático del servidor de IA (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ia-mantenimiento %i
+# Prioridad baja para no frenar a la IA mientras actualiza
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+TimeoutStartSec=3h

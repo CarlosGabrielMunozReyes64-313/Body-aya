@@ -1,0 +1,48 @@
+#!/bin/sh
+# Opciones "Modo servidor" y "Modo escritorio" del menú de arranque.
+# Creado por configurar-arranque.sh  (para quitarlo: sudo bash configurar-arranque.sh --quitar)
+set -e
+
+prefix="/usr"
+exec_prefix="/usr"
+datarootdir="/usr/share"
+. "${datarootdir}/grub/grub-mkconfig_lib"
+
+# Kernel más reciente (Ubuntu mantiene los enlaces /boot/vmlinuz y /boot/initrd.img)
+if [ -e /boot/vmlinuz ] && [ -e /boot/initrd.img ]; then
+  KERNEL="vmlinuz"
+  INITRD="initrd.img"
+else
+  KERNEL="$(cd /boot && ls -1 vmlinuz-* 2>/dev/null | sort -V | tail -n1)"
+  [ -n "$KERNEL" ] || exit 0
+  INITRD="initrd.img-${KERNEL#vmlinuz-}"
+fi
+
+RUTA_BOOT="$(make_system_path_relative_to_its_root /boot)"
+if [ "x${GRUB_DEVICE_UUID}" != "x" ] && [ "x${GRUB_DISABLE_LINUX_UUID}" != "xtrue" ]; then
+  RAIZ="UUID=${GRUB_DEVICE_UUID}"
+else
+  RAIZ="${GRUB_DEVICE}"
+fi
+ACCESO="$(prepare_grub_to_access_device ${GRUB_DEVICE_BOOT} | grub_add_tab)"
+
+echo "Agregando opciones de modo servidor y modo escritorio" >&2
+
+cat << EOF
+menuentry '1    Modo servidor     (solo terminal, la IA queda funcionando)' --hotkey=1 --class ubuntu --class gnu-linux --class os \$menuentry_id_option 'modo-servidor' {
+	load_video
+	insmod gzio
+${ACCESO}
+	echo	'Iniciando en modo servidor...'
+	linux	${RUTA_BOOT}/${KERNEL} root=${RAIZ} ro ${GRUB_CMDLINE_LINUX} quiet systemd.unit=multi-user.target
+	initrd	${RUTA_BOOT}/${INITRD}
+}
+menuentry '2    Modo escritorio   (Ubuntu con interfaz grafica)' --hotkey=2 --class ubuntu --class gnu-linux --class os \$menuentry_id_option 'modo-escritorio' {
+	load_video
+	set gfxpayload=keep
+	insmod gzio
+${ACCESO}
+	linux	${RUTA_BOOT}/${KERNEL} root=${RAIZ} ro ${GRUB_CMDLINE_LINUX} ${GRUB_CMDLINE_LINUX_DEFAULT} vt.handoff=7
+	initrd	${RUTA_BOOT}/${INITRD}
+}
+EOF

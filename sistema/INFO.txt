@@ -1,0 +1,8 @@
+Copia tomada: 2026-10-26 16:47
+Sistema: Ubuntu 26.04.1 LTS
+Kernel: 7.0.0-38-generic
+Ollama: 0.40.11
+
+Modelos instalados:
+  NAME        ID              SIZE      MODIFIED     
+  qwen3:4b    359d7dd4bcda    2.5 GB    15 hours ago    

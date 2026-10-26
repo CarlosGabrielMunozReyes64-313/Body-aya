@@ -1,0 +1,6 @@
+[Unit]
+Description=Respaldo de las conversaciones del servidor de IA
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/ia-servidor respaldo

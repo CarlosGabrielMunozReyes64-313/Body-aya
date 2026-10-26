@@ -1,0 +1,25 @@
+[Unit]
+Description=Servidor de IA (backend para la página web)
+After=network-online.target ollama.service
+Wants=network-online.target ollama.service
+RequiresMountsFor=/mnt/datos
+
+[Service]
+Type=simple
+User=ia-servidor
+Group=ia-servidor
+EnvironmentFile=/etc/ia-servidor/config.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+WorkingDirectory=/opt/ia-servidor
+ExecStart=/opt/ia-servidor/venv/bin/uvicorn app:app --host 127.0.0.1 --port 8000 --proxy-headers --forwarded-allow-ips=127.0.0.1
+Restart=always
+RestartSec=5
+# Protecciones: el servicio solo puede escribir en la carpeta de conversaciones
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/mnt/datos/ia-servidor
+
+[Install]
+WantedBy=multi-user.target

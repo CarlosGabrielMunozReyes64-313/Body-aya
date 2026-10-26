@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# ia-servidor: comandos rápidos para administrar el servidor de IA
+set -euo pipefail
+CONF="/etc/ia-servidor/config.env"
+leer() { local v; v=$(grep -E "^$1=" "$CONF" 2>/dev/null | tail -n1 | cut -d= -f2- || true); v="${v%\"}"; echo "${v#\"}"; }
+root() { [[ $EUID -eq 0 ]] || { echo "Este comando necesita sudo:  sudo ia-servidor $1"; exit 1; }; }
+
+case "${1:-ayuda}" in
+  estado)
+    for s in ollama ia-servidor tailscaled; do
+      printf "  %-12s %s\n" "$s" "$(systemctl is-active "$s" 2>/dev/null || true)"
+    done
+    echo; echo -n "  Backend: "; curl -fsS --max-time 5 http://127.0.0.1:8000/api/salud || echo "no responde"
+    echo; echo "  Modelo: $(leer IA_MODELO)    Datos: $(leer IA_DB)"
+    if command -v tailscale >/dev/null 2>&1; then echo; tailscale funnel status 2>/dev/null || true; fi
+    ;;
+  url)
+    tailscale funnel status
+    ;;
+  logs)
+    journalctl -u ia-servidor -u ollama -f
+    ;;
+  reiniciar)
+    root reiniciar; systemctl restart ollama ia-servidor; echo "Listo."
+    ;;
+  modelo)
+    root modelo
+    [[ -n ${2:-} ]] || { echo "Uso: sudo ia-servidor modelo <nombre>   (ej: llama3.1:8b)"; exit 1; }
+    ollama pull "$2"
+    sed -i "s|^IA_MODELO=.*|IA_MODELO=\"$2\"|" "$CONF"
+    systemctl restart ia-servidor
+    echo "Modelo principal cambiado a $2."
+    ;;
+  clave)
+    root clave
+    read -rsp "Nueva contraseña (mínimo 8 caracteres): " c1; echo
+    (( ${#c1} >= 8 )) || { echo "Muy corta."; exit 1; }
+    read -rsp "Repítela: " c2; echo
+    [[ $c1 == "$c2" ]] || { echo "No coinciden."; exit 1; }
+    h=$(printf '%s' "$c1" | python3 -c 'import sys,os,hashlib
+p=sys.stdin.buffer.read(); s=os.urandom(16); n,r,q=16384,8,1
+h=hashlib.scrypt(p,salt=s,n=n,r=r,p=q,dklen=32)
+print("scrypt:%d:%d:%d:%s:%s"%(n,r,q,s.hex(),h.hex()))')
+    sed -i "s|^IA_PASSWORD_HASH=.*|IA_PASSWORD_HASH=\"$h\"|" "$CONF"
+    db=$(leer IA_DB)
+    if [[ -f $db ]]; then sqlite3 "$db" "DELETE FROM sesiones;"; fi
+    systemctl restart ia-servidor
+    echo "Contraseña cambiada. Todas las sesiones abiertas se cerraron."
+    ;;
+  respaldo)
+    root respaldo
+    db=$(leer IA_DB); dest=/var/backups/ia-servidor
+    [[ -f $db ]] || { echo "Todavía no hay conversaciones para respaldar."; exit 0; }
+    mkdir -p "$dest"; chmod 700 "$dest"
+    archivo="$dest/conversaciones-$(date +%Y-%m-%d).db"
+    sqlite3 "$db" ".backup '$archivo'"
+    find "$dest" -name 'conversaciones-*.db' -mtime +14 -delete
+    echo "Respaldo guardado en $archivo"
+    ;;
+  *)
+    cat <<'AYUDA'
+Uso: ia-servidor <comando>
+  estado              Muestra si todo está funcionando y la dirección pública
+  url                 Muestra la dirección pública del servidor
+  logs                Muestra la actividad en vivo (Ctrl+C para salir)
+  sudo ... reiniciar  Reinicia Ollama y el backend
+  sudo ... modelo X   Descarga el modelo X y lo pone como principal
+  sudo ... clave      Cambia la contraseña de la página
+  sudo ... respaldo   Hace un respaldo de las conversaciones ahora mismo
+AYUDA
+    ;;
+esac

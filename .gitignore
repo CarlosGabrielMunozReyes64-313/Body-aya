@@ -1,0 +1,12 @@
+# Datos privados que nunca deben subirse
+*.db
+*.db-journal
+*.db-wal
+*.jsonl
+config.env
+tailscaled.state
+
+# Archivos generados
+__pycache__/
+*.pyc
+venv/

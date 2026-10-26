@@ -1,0 +1,10 @@
+[Unit]
+Description=Mantenimiento nocturno del servidor de IA
+
+[Timer]
+OnCalendar=*-*-* 04:30:00
+RandomizedDelaySec=5min
+Unit=ia-mantenimiento@nocturno.service
+
+[Install]
+WantedBy=timers.target

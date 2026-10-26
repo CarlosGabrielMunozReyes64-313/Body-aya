@@ -1,0 +1,7 @@
+/var/log/ia-mantenimiento.log {
+    monthly
+    rotate 6
+    compress
+    missingok
+    notifempty
+}

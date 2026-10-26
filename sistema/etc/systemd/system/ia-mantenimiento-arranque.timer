@@ -1,0 +1,9 @@
+[Unit]
+Description=Mantenimiento del servidor de IA al encender
+
+[Timer]
+OnBootSec=3min
+Unit=ia-mantenimiento@arranque.service
+
+[Install]
+WantedBy=timers.target

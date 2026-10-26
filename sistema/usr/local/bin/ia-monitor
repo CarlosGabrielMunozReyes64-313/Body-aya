@@ -1,0 +1,469 @@
+#!/usr/bin/env python3
+"""ia-monitor: panel en vivo del servidor de IA.
+
+Muestra el estado del PC y de la IA, y las preguntas y respuestas mientras se generan.
+Teclas:  q salir   ↑ ↓ RePág AvPág desplazar   Fin volver a lo último
+"""
+import curses
+import json
+import locale
+import os
+import shutil
+import sqlite3
+import subprocess
+import textwrap
+import threading
+import time
+import urllib.request
+from datetime import datetime, timezone
+
+ACTIVIDAD = os.environ.get("IA_ACTIVIDAD", "/run/ia-servidor/actividad.jsonl")
+ESTADO_MANT = "/var/lib/ia-mantenimiento/estado.json"
+CONF = "/etc/ia-servidor/config.env"
+MAX_LINEAS = 3000
+CABECERA = 8  # filas fijas arriba
+
+FASES = {
+    "red": "esperando internet", "reparando": "revisando paquetes",
+    "actualizando": "actualizando el sistema", "snap": "actualizando snaps",
+    "ollama": "actualizando Ollama", "limpiando": "borrando archivos innecesarios",
+    "memoria": "liberando memoria RAM", "terminado": "terminado",
+}
+
+
+def leer_config():
+    datos = {}
+    try:
+        with open(CONF, encoding="utf-8") as f:
+            for linea in f:
+                if "=" in linea and not linea.lstrip().startswith("#"):
+                    k, v = linea.strip().split("=", 1)
+                    datos[k] = v.strip('"')
+    except OSError:
+        pass
+    return datos
+
+
+def pedir_json(url, tiempo=1.5):
+    with urllib.request.urlopen(url, timeout=tiempo) as r:
+        return json.load(r)
+
+
+def humano_gb(b):
+    return f"{b / 1024**3:.1f}"
+
+
+class Estado(threading.Thread):
+    """Recoge el estado del sistema cada 2 segundos sin frenar la pantalla."""
+
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.datos = {}
+        self.conf = leer_config()
+        self._cpu_prev = None
+        self.url = ""
+        try:
+            salida = subprocess.run(["tailscale", "status", "--json"], capture_output=True,
+                                    text=True, timeout=5).stdout
+            dns = json.loads(salida)["Self"]["DNSName"].rstrip(".")
+            if dns:
+                self.url = "https://" + dns
+        except Exception:
+            pass
+
+    def cpu(self):
+        with open("/proc/stat") as f:
+            v = [int(x) for x in f.readline().split()[1:]]
+        inactivo, total = v[3] + v[4], sum(v)
+        uso = None
+        if self._cpu_prev:
+            di, dt = inactivo - self._cpu_prev[0], total - self._cpu_prev[1]
+            uso = 100 * (1 - di / dt) if dt else 0
+        self._cpu_prev = (inactivo, total)
+        return uso
+
+    @staticmethod
+    def temperatura():
+        mejor = None
+        base = "/sys/class/thermal"
+        try:
+            for z in sorted(os.listdir(base)):
+                try:
+                    tipo = open(f"{base}/{z}/type").read().strip()
+                    t = int(open(f"{base}/{z}/temp").read()) / 1000
+                except (OSError, ValueError):
+                    continue
+                if tipo == "x86_pkg_temp":
+                    return t
+                if mejor is None and 0 < t < 120:
+                    mejor = t
+        except OSError:
+            pass
+        return mejor
+
+    @staticmethod
+    def memoria():
+        m = {}
+        with open("/proc/meminfo") as f:
+            for linea in f:
+                k, v = linea.split(":")
+                m[k] = int(v.split()[0]) * 1024
+        return m["MemTotal"], m["MemTotal"] - m["MemAvailable"]
+
+    def conversaciones(self):
+        db = self.conf.get("IA_DB")
+        if not db:
+            return None
+        try:
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=1)
+            n = con.execute("SELECT COUNT(*) FROM conversaciones").fetchone()[0]
+            hoy = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+            m = con.execute("SELECT COUNT(*) FROM mensajes WHERE rol='user' AND creado >= ?",
+                            (hoy.astimezone(timezone.utc).isoformat(timespec="seconds"),)).fetchone()[0]
+            con.close()
+            return n, m
+        except Exception:
+            return None
+
+    def run(self):
+        while True:
+            d = {}
+            try:
+                d["servicios"] = {}
+                for s in ("ollama", "ia-servidor", "tailscaled"):
+                    r = subprocess.run(["systemctl", "is-active", s], capture_output=True, text=True)
+                    d["servicios"][s] = r.stdout.strip() == "active"
+                d["cpu"] = self.cpu()
+                d["nucleos"] = os.cpu_count()
+                d["temp"] = self.temperatura()
+                d["ram"] = self.memoria()
+                d["disco"] = shutil.disk_usage("/")
+                datos_dir = os.path.dirname(self.conf.get("IA_DB", "")) or "/"
+                try:
+                    d["disco_datos"] = shutil.disk_usage(datos_dir)
+                except OSError:
+                    d["disco_datos"] = None
+                with open("/proc/uptime") as f:
+                    d["encendido"] = float(f.read().split()[0])
+                try:
+                    ps = pedir_json("http://127.0.0.1:11434/api/ps").get("models", [])
+                    d["modelos"] = ps
+                except Exception:
+                    d["modelos"] = None
+                d["conv"] = self.conversaciones()
+                try:
+                    with open(ESTADO_MANT, encoding="utf-8") as f:
+                        d["mant"] = json.load(f)
+                except (OSError, ValueError):
+                    d["mant"] = None
+                d["reinicio"] = os.path.exists("/run/reboot-required")
+            except Exception as e:  # nunca romper el panel por un dato
+                d["error"] = str(e)
+            self.datos = d
+            time.sleep(2)
+
+
+class Feed:
+    """Lee el registro de actividad y lo convierte en líneas con color."""
+
+    def __init__(self, colores):
+        self.c = colores
+        self.lineas = []  # (texto, atributo)
+        self.modo = None
+        self.f = None
+        self.inodo = None
+        self.resto = ""
+        self.ultima_velocidad = None
+        self.trabajando = False
+
+    def agregar(self, texto, attr):
+        self.lineas.append([texto, attr])
+        if len(self.lineas) > MAX_LINEAS:
+            del self.lineas[: len(self.lineas) - MAX_LINEAS]
+
+    def continuar(self, trozo, attr, sangria="       "):
+        partes = trozo.split("\n")
+        if self.lineas:
+            self.lineas[-1][0] += partes[0]
+        for p in partes[1:]:
+            self.agregar(sangria + p, attr)
+
+    def evento(self, e):
+        tipo, hora = e.get("tipo"), e.get("hora", "")
+        c = self.c
+        if tipo == "pregunta":
+            self.agregar("", 0)
+            extra = "  · pensando activado" if e.get("pensar") else ""
+            self.agregar(f"── {hora}  {e.get('conversacion', '')[:50]}  ({e.get('modelo', '')}){extra}",
+                         c["titulo"])
+            lineas = (e.get("texto") or "").split("\n")
+            self.agregar("  Tú: " + lineas[0], c["pregunta"])
+            for l in lineas[1:]:
+                self.agregar("       " + l, c["pregunta"])
+            self.modo = None
+            self.trabajando = True
+        elif tipo == "pensamiento":
+            if self.modo != "pensamiento":
+                self.agregar("  Pensando: ", c["pensamiento"])
+                self.modo = "pensamiento"
+                trozo = e.get("texto", "").lstrip()
+            else:
+                trozo = e.get("texto", "")
+            self.continuar(trozo, c["pensamiento"])
+        elif tipo == "texto":
+            if self.modo != "texto":
+                self.agregar("  IA:  ", c["respuesta"])
+                self.modo = "texto"
+                trozo = e.get("texto", "").lstrip()
+            else:
+                trozo = e.get("texto", "")
+            self.continuar(trozo, c["respuesta"])
+        elif tipo == "fin":
+            v = e.get("tokens_por_segundo")
+            self.ultima_velocidad = v
+            detalle = f"{e.get('tokens')} tokens a {v} tokens/s" if v else "listo"
+            self.agregar(f"  [OK] {hora}  respuesta terminada · {detalle}", c["ok"])
+            self.modo, self.trabajando = None, False
+        elif tipo == "error":
+            self.agregar(f"  [ERROR] {hora}  {e.get('mensaje', '')}", c["error"])
+            self.modo, self.trabajando = None, False
+        elif tipo == "cancelado":
+            self.agregar(f"  [!] {hora}  la página se cerró antes de terminar (se guardó lo generado)",
+                         c["aviso"])
+            self.modo, self.trabajando = None, False
+        elif tipo == "login":
+            if e.get("ok"):
+                self.agregar(f"  {hora}  alguien inició sesión en la página", c["info"])
+            else:
+                self.agregar(f"  [!] {hora}  intento de inicio de sesión con contraseña incorrecta",
+                             c["aviso"])
+        elif tipo == "sistema":
+            self.agregar(f"  {hora}  {e.get('texto', '')}", c["info"])
+
+    def leer(self):
+        try:
+            st = os.stat(ACTIVIDAD)
+        except OSError:
+            return
+        if self.f is None or st.st_ino != self.inodo or st.st_size < self.f.tell():
+            if self.f:
+                self.f.close()
+            self.f = open(ACTIVIDAD, encoding="utf-8", errors="replace")
+            primera_vez = self.inodo is None
+            self.inodo = st.st_ino
+            self.resto = ""
+            if primera_vez and st.st_size > 200_000:  # al abrir, mostrar solo lo más reciente
+                self.f.seek(st.st_size - 200_000)
+                self.f.readline()
+        datos = self.f.read()
+        if not datos:
+            return
+        datos = self.resto + datos
+        lineas = datos.split("\n")
+        self.resto = lineas.pop()
+        for l in lineas:
+            try:
+                self.evento(json.loads(l))
+            except ValueError:
+                pass
+
+
+def barra(fraccion, ancho=10):
+    fraccion = max(0.0, min(1.0, fraccion))
+    lleno = round(fraccion * ancho)
+    return "█" * lleno + "░" * (ancho - lleno)
+
+
+def duracion(seg):
+    seg = int(seg)
+    d, h, m = seg // 86400, seg % 86400 // 3600, seg % 3600 // 60
+    if d:
+        return f"{d} d {h} h"
+    if h:
+        return f"{h} h {m} min"
+    return f"{m} min"
+
+
+def escribir(pantalla, y, x, texto, attr=0):
+    alto, ancho = pantalla.getmaxyx()
+    if y < 0 or y >= alto or x >= ancho - 1:
+        return x
+    texto = texto[: max(0, ancho - 1 - x)]
+    try:
+        pantalla.addstr(y, x, texto, attr)
+    except curses.error:
+        pass
+    return x + len(texto)
+
+
+def dibujar_cabecera(p, est, feed, c):
+    alto, ancho = p.getmaxyx()
+    d = est.datos
+    ahora = datetime.now().strftime("%H:%M:%S")
+    titulo = f" SERVIDOR DE IA   {ahora}"
+    if d.get("encendido"):
+        titulo += f"   encendido hace {duracion(d['encendido'])}"
+    escribir(p, 0, 0, titulo.ljust(ancho - 1), c["barra"])
+
+    x = 1
+    nombres = {"ollama": "Ollama", "ia-servidor": "Backend", "tailscaled": "Túnel"}
+    for s, activo in d.get("servicios", {}).items():
+        x = escribir(p, 1, x, nombres[s] + " ")
+        x = escribir(p, 1, x, "[activo]" if activo else "[DETENIDO]", c["ok"] if activo else c["error"])
+        x += 3
+    if est.url:
+        escribir(p, 1, x, est.url, c["info"])
+
+    cpu = d.get("cpu")
+    linea = f" CPU {barra((cpu or 0) / 100)} {cpu or 0:3.0f}%  ({d.get('nucleos', '?')} hilos)"
+    if d.get("temp"):
+        linea += f"  {d['temp']:.0f}°C"
+    if d.get("ram"):
+        total, usado = d["ram"]
+        linea += f"     RAM {barra(usado / total)} {humano_gb(usado)} de {humano_gb(total)} GB"
+    escribir(p, 2, 0, linea)
+
+    modelos = d.get("modelos")
+    if modelos is None:
+        linea, attr = " IA: Ollama no responde", c["error"]
+    elif modelos:
+        m = modelos[0]
+        linea = f" IA: modelo {m.get('name')} cargado en memoria ({humano_gb(m.get('size', 0))} GB)"
+        attr = c["ok"]
+    else:
+        linea, attr = f" IA: en espera (el modelo {est.conf.get('IA_MODELO', '')} se carga con la primera pregunta)", 0
+    if feed.trabajando:
+        linea, attr = linea + "   >>> GENERANDO RESPUESTA <<<", c["titulo"]
+    elif feed.ultima_velocidad:
+        linea += f"   última velocidad: {feed.ultima_velocidad} tokens/s"
+    escribir(p, 3, 0, linea, attr)
+
+    partes = []
+    if d.get("disco"):
+        partes.append(f"SSD {humano_gb(d['disco'].used)}/{humano_gb(d['disco'].total)} GB")
+    if d.get("disco_datos"):
+        partes.append(f"Datos {humano_gb(d['disco_datos'].used)}/{humano_gb(d['disco_datos'].total)} GB")
+    if d.get("conv"):
+        partes.append(f"Conversaciones: {d['conv'][0]}   Preguntas hoy: {d['conv'][1]}")
+    escribir(p, 4, 0, " " + "    ".join(partes))
+
+    mant = d.get("mant")
+    if not mant:
+        linea, attr = " Mantenimiento: todavía no se ha ejecutado (corre al encender y a las 4:30 a.m.)", 0
+    elif mant.get("estado") == "en_curso":
+        linea = f" Mantenimiento EN CURSO: {FASES.get(mant.get('fase'), mant.get('fase', ''))}..."
+        attr = c["aviso"]
+    else:
+        cuando = (mant.get("fin") or "")[:16].replace("T", " ")
+        ok = mant.get("estado") == "ok"
+        linea = (f" Mantenimiento: {cuando}  {'[OK]' if ok else '[CON ERRORES]'}  "
+                 f"{mant.get('paquetes', 0)} paquetes actualizados, {mant.get('liberado_mb', 0)} MB liberados")
+        attr = 0 if ok else c["aviso"]
+    escribir(p, 5, 0, linea, attr)
+    if d.get("reinicio"):
+        escribir(p, 6, 0, " ! Hay actualizaciones que necesitan reiniciar (se hará solo a las 4:30 a.m.)",
+                 c["aviso"])
+
+    escribir(p, CABECERA - 1, 0, ("─── Actividad en vivo " + "─" * ancho)[: ancho - 1], c["titulo"])
+
+
+def lineas_visibles(feed, ancho, alto_feed, desplazamiento):
+    """Parte las líneas al ancho de la pantalla, empezando por el final."""
+    salida = []
+    necesarias = alto_feed + desplazamiento
+    for texto, attr in reversed(feed.lineas):
+        trozos = textwrap.wrap(texto, max(10, ancho - 2), replace_whitespace=False,
+                               drop_whitespace=False, subsequent_indent="       ") or [""]
+        for t in reversed(trozos):
+            salida.append((t, attr))
+        if len(salida) >= necesarias:
+            break
+    salida.reverse()
+    desplazamiento = max(0, min(desplazamiento, len(salida) - alto_feed))
+    fin = len(salida) - desplazamiento
+    return salida[max(0, fin - alto_feed): fin], desplazamiento
+
+
+def principal(p):
+    curses.curs_set(0)
+    p.nodelay(True)
+    p.keypad(True)
+    curses.start_color()
+    try:
+        curses.use_default_colors()
+        fondo = -1
+    except curses.error:
+        fondo = curses.COLOR_BLACK
+    pares = {
+        "barra": (curses.COLOR_BLACK, curses.COLOR_CYAN), "titulo": (curses.COLOR_CYAN, fondo),
+        "pregunta": (curses.COLOR_YELLOW, fondo), "respuesta": (curses.COLOR_GREEN, fondo),
+        "pensamiento": (curses.COLOR_MAGENTA, fondo), "ok": (curses.COLOR_GREEN, fondo),
+        "error": (curses.COLOR_RED, fondo), "aviso": (curses.COLOR_YELLOW, fondo),
+        "info": (curses.COLOR_BLUE, fondo),
+    }
+    c = {}
+    for i, (nombre, (fg, bg)) in enumerate(pares.items(), start=1):
+        curses.init_pair(i, fg, bg)
+        c[nombre] = curses.color_pair(i)
+    c["titulo"] |= curses.A_BOLD
+    c["barra"] |= curses.A_BOLD
+    c["pregunta"] |= curses.A_BOLD
+    c["info"] |= curses.A_BOLD
+
+    est = Estado()
+    est.start()
+    feed = Feed(c)
+    desplazamiento = 0
+    fase_previa = None
+
+    while True:
+        feed.leer()
+        mant = est.datos.get("mant") or {}
+        fase = (mant.get("estado"), mant.get("fase"))
+        if fase != fase_previa and fase_previa is not None and mant.get("estado") == "en_curso":
+            feed.evento({"tipo": "sistema", "hora": datetime.now().strftime("%H:%M:%S"),
+                         "texto": f"Mantenimiento: {FASES.get(mant.get('fase'), mant.get('fase'))}..."})
+        elif fase != fase_previa and fase_previa and fase_previa[0] == "en_curso":
+            feed.evento({"tipo": "sistema", "hora": datetime.now().strftime("%H:%M:%S"),
+                         "texto": "Mantenimiento terminado."})
+        fase_previa = fase
+
+        alto, ancho = p.getmaxyx()
+        alto_feed = max(1, alto - CABECERA - 1)
+        p.erase()
+        dibujar_cabecera(p, est, feed, c)
+        visibles, desplazamiento = lineas_visibles(feed, ancho, alto_feed, desplazamiento)
+        if not feed.lineas:
+            escribir(p, CABECERA + 1, 2, "Esperando actividad... Las preguntas que hagas desde la página "
+                                         "aparecerán aquí en vivo.")
+        for i, (t, attr) in enumerate(visibles):
+            escribir(p, CABECERA + i, 1, t, attr)
+        pie = " q: salir a la terminal    ↑ ↓ RePág AvPág: desplazar    Fin: volver a lo último "
+        if desplazamiento:
+            pie += f"   (viendo historial, {desplazamiento} líneas arriba)"
+        escribir(p, alto - 1, 0, pie.ljust(ancho - 1), c["barra"])
+        p.refresh()
+
+        tecla = p.getch()
+        if tecla in (ord("q"), ord("Q"), 27):
+            break
+        elif tecla == curses.KEY_UP:
+            desplazamiento += 1
+        elif tecla == curses.KEY_DOWN:
+            desplazamiento = max(0, desplazamiento - 1)
+        elif tecla == curses.KEY_PPAGE:
+            desplazamiento += alto_feed - 1
+        elif tecla == curses.KEY_NPAGE:
+            desplazamiento = max(0, desplazamiento - (alto_feed - 1))
+        elif tecla in (curses.KEY_END, ord("f")):
+            desplazamiento = 0
+        time.sleep(0.08)
+
+
+if __name__ == "__main__":
+    locale.setlocale(locale.LC_ALL, "")
+    os.environ.setdefault("ESCDELAY", "25")
+    try:
+        curses.wrapper(principal)
+    except KeyboardInterrupt:
+        pass

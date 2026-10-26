@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Abre la interfaz gráfica desde el modo servidor, sin reiniciar. La IA sigue funcionando.
+if systemctl is-active --quiet display-manager; then
+  echo "La interfaz gráfica ya está activa."
+  exit 0
+fi
+echo "Abriendo la interfaz gráfica... (la IA sigue funcionando)"
+exec sudo systemctl start graphical.target

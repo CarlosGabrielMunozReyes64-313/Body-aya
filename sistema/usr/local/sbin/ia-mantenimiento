@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  ia-mantenimiento: actualiza el sistema, borra archivos innecesarios y libera RAM.
+#  Se ejecuta solo al encender el PC (3 min después) y todas las noches a las 4:30 a.m.
+#  Para ejecutarlo a mano:  sudo ia-mantenimiento
+#  Registro completo:       /var/log/ia-mantenimiento.log
+# =============================================================================
+set -uo pipefail
+
+MODO="${1:-manual}"            # arranque | nocturno | manual
+REINICIO_AUTOMATICO="si"        # reiniciar solo si una actualización lo pide (solo de noche)
+ACTUALIZAR_OLLAMA="si"          # instalar versiones nuevas de Ollama cuando salgan
+DIAS_REGISTROS=30               # días de registros del sistema que se conservan
+
+ESTADO_DIR=/var/lib/ia-mantenimiento
+ESTADO="$ESTADO_DIR/estado.json"
+LOG=/var/log/ia-mantenimiento.log
+ACTIVIDAD=/run/ia-servidor/actividad.jsonl
+export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
+APT=(apt-get -y -q -o DPkg::Lock::Timeout=1800
+     -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+
+[[ $EUID -eq 0 ]] || { echo "Ejecuta con sudo:  sudo ia-mantenimiento"; exit 1; }
+mkdir -p "$ESTADO_DIR"
+exec 9>/run/ia-mantenimiento.lock
+flock -n 9 || { echo "Ya hay un mantenimiento en curso."; exit 0; }
+
+INICIO=$(date -Iseconds)
+ERRORES=0
+PAQUETES=0
+LIBERADO_MB=0
+NOTAS=""
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG"; }
+correr() {  # ejecuta un comando guardando su salida en el registro
+  "$@" >>"$LOG" 2>&1
+  local rc=$?
+  if (( rc != 0 )); then log "  ! falló ($rc): $*"; ERRORES=$((ERRORES + 1)); fi
+  return $rc
+}
+estado() {  # estado en_curso|ok|error  fase
+  ESTADO_TXT="$1" FASE="$2" INICIO="$INICIO" PAQUETES="$PAQUETES" LIBERADO="$LIBERADO_MB" \
+  NOTAS="$NOTAS" MODO="$MODO" python3 - "$ESTADO" <<'PY'
+import json, os, sys, datetime
+d = {"estado": os.environ["ESTADO_TXT"], "fase": os.environ["FASE"], "modo": os.environ["MODO"],
+     "inicio": os.environ["INICIO"], "paquetes": int(os.environ["PAQUETES"]),
+     "liberado_mb": int(os.environ["LIBERADO"]), "notas": os.environ["NOTAS"].strip(),
+     "reinicio_pendiente": os.path.exists("/run/reboot-required")}
+if d["estado"] != "en_curso":
+    d["fin"] = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+tmp = sys.argv[1] + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(d, f, ensure_ascii=False)
+os.chmod(tmp, 0o644)
+os.replace(tmp, sys.argv[1])
+PY
+}
+usado_mb() { df -Pm / | awk 'NR==2 {print $3}'; }
+ram_libre_mb() { free -m | awk '/^Mem:/ {print $7}'; }
+
+log "════════ Mantenimiento ($MODO) ════════"
+
+# ------------------------------------------------------------------ 1. internet
+estado en_curso red
+HAY_RED=0
+for _ in $(seq 1 24); do
+  if curl -fsS --max-time 5 -o /dev/null http://archive.ubuntu.com/ubuntu/; then HAY_RED=1; break; fi
+  sleep 5
+done
+if (( HAY_RED )); then log "Internet: disponible"; else log "Internet: NO disponible, se omiten las actualizaciones"; NOTAS+="sin internet; "; fi
+
+if (( HAY_RED )); then
+  # ---------------------------------------------------------------- 2. actualizar
+  estado en_curso reparando
+  log "Revisando que no haya instalaciones a medias (por ejemplo tras un corte de luz)..."
+  correr dpkg --configure -a
+  correr "${APT[@]}" -f install
+
+  estado en_curso actualizando
+  log "Actualizando la lista de paquetes..."
+  correr "${APT[@]}" update
+  PAQUETES=$(apt-get -s full-upgrade 2>/dev/null | grep -c '^Inst ' || true)
+  log "Paquetes por actualizar: $PAQUETES"
+  if (( PAQUETES > 0 )); then
+    correr nice -n 10 "${APT[@]}" full-upgrade && log "Sistema actualizado"
+  fi
+
+  if command -v snap >/dev/null 2>&1; then
+    estado en_curso snap
+    log "Actualizando aplicaciones snap..."
+    correr snap refresh
+  fi
+
+  # ---------------------------------------------------------------- 3. ollama
+  if [[ $ACTUALIZAR_OLLAMA == si ]] && command -v ollama >/dev/null 2>&1; then
+    ACTUAL=$(ollama --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | tail -n1)
+    ULTIMA=$(curl -fsSL --max-time 15 https://api.github.com/repos/ollama/ollama/releases/latest 2>/dev/null \
+             | python3 -c 'import sys,json; print(json.load(sys.stdin)["tag_name"].lstrip("v"))' 2>/dev/null)
+    if [[ -n $ACTUAL && -n $ULTIMA && $ACTUAL != "$ULTIMA" ]] \
+       && [[ $(printf '%s\n%s\n' "$ACTUAL" "$ULTIMA" | sort -V | tail -n1) == "$ULTIMA" ]]; then
+      estado en_curso ollama
+      log "Actualizando Ollama $ACTUAL → $ULTIMA..."
+      if correr sh -c 'curl -fsSL https://ollama.com/install.sh | sh'; then
+        systemctl daemon-reload
+        systemctl restart ollama ia-servidor
+        NOTAS+="Ollama actualizado a $ULTIMA; "
+        log "Ollama actualizado"
+      fi
+    else
+      log "Ollama ya está en la última versión (${ACTUAL:-?})"
+    fi
+  fi
+fi
+
+# ------------------------------------------------------------------ 4. limpiar
+estado en_curso limpiando
+log "Borrando archivos innecesarios..."
+ANTES_MB=$(usado_mb)
+correr "${APT[@]}" autoremove --purge
+correr "${APT[@]}" autoclean
+correr apt-get clean
+correr journalctl --vacuum-time="${DIAS_REGISTROS}d" --vacuum-size=300M
+if command -v snap >/dev/null 2>&1; then
+  snap set system refresh.retain=2 >>"$LOG" 2>&1 || true
+  snap list --all 2>/dev/null | awk '/disabled/ {print $1, $3}' | while read -r nombre revision; do
+    correr snap remove "$nombre" --revision="$revision"
+  done
+fi
+find /var/crash -type f -mtime +7 -delete 2>/dev/null || true
+rm -rf /root/.cache/pip 2>/dev/null || true
+for h in /home/*; do
+  [[ -d $h/.cache/thumbnails ]] && find "$h/.cache/thumbnails" -type f -atime +30 -delete 2>/dev/null
+done
+systemd-tmpfiles --clean >>"$LOG" 2>&1 || true
+LIBERADO_MB=$(( ANTES_MB - $(usado_mb) ))
+(( LIBERADO_MB < 0 )) && LIBERADO_MB=0
+log "Espacio liberado en el SSD: ${LIBERADO_MB} MB"
+
+# ------------------------------------------------------------------ 5. memoria
+estado en_curso memoria
+RAM_ANTES=$(ram_libre_mb)
+sync
+echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+[[ -w /proc/sys/vm/compact_memory ]] && echo 1 > /proc/sys/vm/compact_memory 2>/dev/null
+SWAP_USADA=$(free -m | awk '/^Swap:/ {print $3}')
+if (( SWAP_USADA > 0 )) && (( $(ram_libre_mb) > SWAP_USADA + 1024 )); then
+  log "Devolviendo ${SWAP_USADA} MB de swap a la RAM..."
+  swapoff -a && swapon -a
+fi
+log "RAM disponible: ${RAM_ANTES} MB → $(ram_libre_mb) MB"
+
+# ------------------------------------------------------------------ 6. reinicio
+if [[ -f /run/reboot-required ]]; then
+  if [[ $MODO == nocturno && $REINICIO_AUTOMATICO == si ]]; then
+    # Si alguien está usando la IA, esperar hasta 30 min a que termine
+    for _ in $(seq 1 30); do
+      [[ -f $ACTIVIDAD ]] && (( $(date +%s) - $(stat -c %Y "$ACTIVIDAD") < 300 )) || break
+      sleep 60
+    done
+    log "Una actualización necesita reiniciar: el PC se reiniciará en 2 minutos."
+    NOTAS+="reinicio programado; "
+    estado ok terminado
+    shutdown -r +2 "Reinicio automático por actualizaciones del servidor de IA" >/dev/null 2>&1
+    exit 0
+  else
+    log "Una actualización necesita reiniciar; se hará en el mantenimiento de las 4:30 a.m."
+    NOTAS+="pendiente reiniciar; "
+  fi
+fi
+
+if (( ERRORES > 0 )); then
+  estado error terminado
+  log "Terminado con $ERRORES problema(s). Revisa este registro."
+else
+  estado ok terminado
+  log "Terminado correctamente."
+fi
